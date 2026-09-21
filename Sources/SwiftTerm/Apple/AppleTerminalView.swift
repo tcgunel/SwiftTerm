@@ -1825,6 +1825,15 @@ extension TerminalView {
             context.setAllowsFontSmoothing(fontSmoothing)
             #endif
 
+            // Glyphs of a line that has just completed fade in. Only the
+            // glyphs: the row's background stays opaque, so a fading line can
+            // never ghost over the one it replaced.
+            let fadeAlpha = lineFadeAlpha(forRow: row)
+            if fadeAlpha < 1 {
+                context.saveGState()
+                context.setAlpha(fadeAlpha)
+            }
+
             // Glyph drawing loop — reuses cached CTLines
             for prepared in preparedSegments {
                 var processedGlyphs = 0
@@ -1933,6 +1942,10 @@ extension TerminalView {
                         drawRunAttributes(runAttributes, glyphPositions: positions, in: context)
                     }
                 }
+            }
+
+            if fadeAlpha < 1 {
+                context.restoreGState()
             }
 
             if !lineInfo.kittyPlaceholders.isEmpty {
@@ -2093,6 +2106,9 @@ extension TerminalView {
             return
         }
         updateCursorPosition()
+        if expireLineFades() {
+            scheduleFadeTick()
+        }
         guard let (rowStart, rowEnd) = terminal.getUpdateRange () else {
             if notifyUpdateChanges {
                 let buffer = terminal.displayBuffer
@@ -2287,11 +2303,130 @@ extension TerminalView {
            caretCol >= 0, caretCol < bidiLayout.logicalToVisualCol.count {
             caretCol = bidiLayout.logicalToVisualCol[caretCol]
         }
-        caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(caretCol)), y: lineOrigin.y)
+        glideCaret(to: CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(caretCol)),
+                               y: lineOrigin.y))
         caretView.frame.size.width = cellDimension.width * doublePosition * CGFloat(cursorColumnWidth)
         caretView.setText (ch: charUnderCursor)
     }
     
+    /// Moves the caret, easing it across short steps and placing it outright
+    /// for everything else.
+    ///
+    /// The animation starts from wherever the caret currently *is* rather than
+    /// from its last resting place, so a keystroke landing mid-glide carries
+    /// the caret on smoothly instead of snapping it back first.
+    func glideCaret(to origin: CGPoint) {
+        guard let caretView else { return }
+        let current = caretView.frame.origin
+        let distance = abs(origin.x - current.x)
+        let now = CACurrentMediaTime()
+        // A person types a handful of characters a second; a program can move
+        // the caret hundreds of times a second. Past a typing pace the caret
+        // jumps instead: gliding every step would both cost an animation each
+        // time and leave the caret visibly trailing the text.
+        let shouldGlide = caretGlideDuration > 0
+            && caretView.superview === self
+            && now - lastCaretGlide > 0.04
+            && abs(origin.y - current.y) < 0.5
+            && distance > 0.5
+            && distance <= cellDimension.width * 3
+
+        let key = "ookook.caretGlide"
+        guard shouldGlide, let layer = caretView.layer else {
+            caretView.layer?.removeAnimation(forKey: key)
+            caretView.frame.origin = origin
+            return
+        }
+        lastCaretGlide = now
+        let from = layer.presentation()?.position.x ?? layer.position.x
+        caretView.frame.origin = origin
+        let glide = CABasicAnimation(keyPath: "position.x")
+        glide.fromValue = from
+        glide.toValue = origin.x + caretView.frame.width / 2
+        glide.duration = caretGlideDuration
+        glide.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(glide, forKey: key)
+    }
+
+    // MARK: - Lines fading in
+
+    /// Marks the line the cursor just left as freshly completed, so it can fade
+    /// in. Called from `linefeed`, which runs after the cursor has moved.
+    func recordLineFade() {
+        guard lineFadeInDuration > 0, !terminal.isCurrentBufferAlternate else { return }
+        let now = CACurrentMediaTime()
+        lineFadeStamps.removeAll { now - $0 > 1 }
+        guard lineFadeStamps.count < Self.lineFadeMaxPerSecond else { return }
+        lineFadeStamps.append(now)
+
+        let buffer = terminal.buffer
+        let row = buffer.yBase + buffer.y - 1
+        guard row >= 0, row < buffer.lines.count else { return }
+        lineFades[buffer.totalLinesTrimmed + row] = now
+        scheduleFadeTick()
+    }
+
+    /// Drops finished fades, repaints the lines still fading, and answers
+    /// whether any are left to animate.
+    @discardableResult
+    func expireLineFades() -> Bool {
+        guard !lineFades.isEmpty else { return false }
+        let now = CACurrentMediaTime()
+        var finished: [Int] = []
+        for (line, start) in lineFades where now - start >= lineFadeInDuration {
+            finished.append(line)
+        }
+        for line in finished {
+            lineFades.removeValue(forKey: line)
+        }
+        repaintFadingLines()
+        return !lineFades.isEmpty
+    }
+
+    /// Opacity of a line that is fading in; fully opaque once it has arrived.
+    func lineFadeAlpha(forRow row: Int) -> CGFloat {
+        guard lineFadeInDuration > 0, !terminal.isCurrentBufferAlternate else { return 1 }
+        guard let start = lineFades[terminal.displayBuffer.totalLinesTrimmed + row] else { return 1 }
+        let progress = max(0, (CACurrentMediaTime() - start) / lineFadeInDuration)
+        guard progress < 1 else { return 1 }
+        // Ease out: readable almost at once, then a soft landing.
+        return CGFloat(1 - pow(1 - progress, 3))
+    }
+
+    /// A fade is an alpha ramp, not motion: a handful of steps a second is
+    /// indistinguishable, and each step costs an invalidation. Ticking at the
+    /// display's 120 or 180Hz buys nothing anyone can see.
+    static let fadeTickInterval: TimeInterval = 1.0 / 30
+
+    /// Keeps redrawing while lines are fading - and only the rows they occupy.
+    ///
+    /// Deliberately does not go through `updateDisplay`: that path also moves
+    /// the caret and lays out bidirectional text, neither of which a fade
+    /// needs, and both of which are far more expensive than the fade itself.
+    func scheduleFadeTick() {
+        guard !fadeTickScheduled else { return }
+        fadeTickScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.fadeTickInterval) { [weak self] in
+            guard let self else { return }
+            self.fadeTickScheduled = false
+            guard self.expireLineFades() else { return }
+            self.scheduleFadeTick()
+        }
+    }
+
+    func repaintFadingLines() {
+        guard !lineFades.isEmpty, let cellHeight = cellDimension?.height, cellHeight > 0 else { return }
+        let buffer = terminal.displayBuffer
+        for line in lineFades.keys {
+            let screenRow = line - buffer.totalLinesTrimmed - buffer.yDisp
+            guard screenRow >= 0, screenRow < buffer.rows else { continue }
+            setNeedsDisplay(CGRect(x: 0,
+                                   y: frame.height - cellHeight * CGFloat(screenRow + 1),
+                                   width: frame.width,
+                                   height: cellHeight))
+        }
+    }
+
     // Does not use a default argument and merge, because it is called back
     func updateDisplay ()
     {

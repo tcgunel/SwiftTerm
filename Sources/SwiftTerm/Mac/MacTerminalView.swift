@@ -942,6 +942,38 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         max(0, size.width - reservedScrollerWidth)
     }
     
+    // MARK: - Motion
+
+    /// How long the caret takes to glide to a new cell, in seconds. Zero jumps,
+    /// which is the historical behaviour.
+    ///
+    /// Only short moves within a row glide: a linefeed, a jump elsewhere on the
+    /// screen or a burst of output moves the caret outright, because a caret
+    /// that eases its way across the screen is slower to read than one that is
+    /// simply where it belongs.
+    public var caretGlideDuration: TimeInterval = 0
+
+    /// How long a freshly completed line takes to fade in, in seconds. Zero
+    /// disables the effect.
+    ///
+    /// Only the primary screen fades. A full-screen application repaints its
+    /// rows continuously, where a fade reads as a flicker rather than as output
+    /// arriving, and a flood of lines is skipped for the same reason.
+    public var lineFadeInDuration: TimeInterval = 0
+
+    /// When the caret last glided, to keep a flood of output from animating
+    /// every step.
+    var lastCaretGlide: TimeInterval = 0
+    /// When each fading line started, keyed by absolute buffer line so a fade
+    /// follows its line while it scrolls and survives scrollback trimming.
+    var lineFades: [Int: TimeInterval] = [:]
+    /// Lines completed in the last second, for the rate guard.
+    var lineFadeStamps: [TimeInterval] = []
+    /// True while a redraw is already scheduled to advance the fades.
+    var fadeTickScheduled = false
+    /// Lines a second that may fade before the effect is skipped entirely.
+    static let lineFadeMaxPerSecond = 20
+
     open func scrolled(source terminal: Terminal, yDisp: Int) {
         //selectionView.notifyScrolled(source: terminal)
         updateScroller()
@@ -953,6 +985,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if allowMouseReporting {
             selection.selectNone()
         }
+        recordLineFade()
     }
     
     /// This vaiable controls whether mouse events are sent to the application running under the
