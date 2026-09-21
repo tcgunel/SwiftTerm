@@ -2314,9 +2314,11 @@ extension TerminalView {
         }
         // throttle
         if !pendingDisplay {
-            let fps60 = 16670000
-            // let fps30 = 16670000*2
-            let fpsDelay = fps60
+            // Repaint at the display's refresh rate rather than a fixed 16.67ms
+            // (60fps): on a 120Hz or 180Hz screen the terminal is otherwise
+            // visibly capped while output streams.
+            let rate = Double(window?.screen?.maximumFramesPerSecond ?? 60)
+            let fpsDelay = UInt64(1_000_000_000.0 / max(30, rate))
             pendingDisplay = true
             DispatchQueue.main.asyncAfter(
                 deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
@@ -2338,8 +2340,8 @@ extension TerminalView {
             return
         }
         if !pendingMetalDisplay {
-            let fps60 = 16670000
-            let fpsDelay = fps60
+            let rate = Double(window?.screen?.maximumFramesPerSecond ?? 60)
+            let fpsDelay = UInt64(1_000_000_000.0 / max(30, rate))
             pendingMetalDisplay = true
             DispatchQueue.main.asyncAfter(
                 deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay))) { [weak self] in
