@@ -580,11 +580,54 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 #endif
 
+    private var occlusionObserver: NSObjectProtocol?
+    private var repaintHealTimer: Timer?
+
+    /// Repaints everything every couple of seconds, whether or not anything
+    /// changed.
+    ///
+    /// A cache of what is already on screen is only as good as its idea of what
+    /// AppKit has thrown away, and AppKit has more ways to do that than are
+    /// worth enumerating - a backing store released while a window is off
+    /// screen, a display reconfiguration, a view shuffled between hosts. One
+    /// full repaint every two seconds costs almost nothing and bounds any
+    /// staleness to that.
+    func startRepaintHealing() {
+        guard repaintHealTimer == nil else { return }
+        repaintHealTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isOnScreen else { return }
+                self.paintedRows.removeAll()
+                self.paintedLayerContents = nil
+                self.lastInvalidatedRegion = nil
+                self.needsDisplay = true
+            }
+        }
+    }
+
     open override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // The layer's backing store does not survive leaving the window.
+        // The layer's backing store does not survive leaving the window, and an
+        // occluded window's may be released too.
         paintedRows.removeAll()
+        paintedLayerContents = nil
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+            self.occlusionObserver = nil
+        }
+        if let window {
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: window,
+                queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.paintedRows.removeAll()
+                        self?.paintedLayerContents = nil
+                    }
+                }
+        }
         startWindowMouseMovedFallback()
+        startRepaintHealing()
 #if canImport(MetalKit)
         guard useMetalRenderer, let currentWindow = window else { return }
         if currentWindow !== metalBoundWindow {
@@ -984,9 +1027,23 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// the palette installed by `installColors`, the hovered link.
     var rowRenderEpoch: UInt64 = 0
     /// The region this view last asked AppKit to repaint. A draw of anything
-    /// else - AppKit re-creating the layer's backing store, a resize, a view
-    /// coming back into the window - cannot trust the cached rows.
+    /// else - a resize, a view coming back into the window - cannot trust the
+    /// cached rows.
     var lastInvalidatedRegion: CGRect?
+    /// True when this view is on a window that is actually on screen - the only
+    /// state in which AppKit keeps what was drawn. A view painted before its
+    /// window is shown has the pixels thrown away, and a row remembered as
+    /// painted then would never be drawn again.
+    var isOnScreen: Bool {
+        guard let window, window.isVisible else { return false }
+        return window.occlusionState.contains(.visible)
+    }
+
+    /// The backing store the cached rows were painted into. AppKit re-creates
+    /// one when the view is resized, comes back on screen or is redrawn for its
+    /// own reasons, and the new one starts empty: the rows are unchanged but
+    /// their pixels are gone.
+    var paintedLayerContents: ObjectIdentifier?
 
     /// When the caret last glided, to keep a flood of output from animating
     /// every step.
@@ -1101,6 +1158,27 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     open override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         paintedRows.removeAll()
+    }
+
+    /// Re-parenting - SwiftUI swapping which tile hosts this terminal, or a
+    /// grid reflow - is not a window change, but it is a redraw the cache must
+    /// not sit through.
+    open override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        paintedRows.removeAll()
+        paintedLayerContents = nil
+    }
+
+    open override func viewDidHide() {
+        super.viewDidHide()
+        paintedRows.removeAll()
+        paintedLayerContents = nil
+    }
+
+    open override func viewDidUnhide() {
+        super.viewDidUnhide()
+        paintedRows.removeAll()
+        paintedLayerContents = nil
     }
     
     public override func cursorUpdate(with event: NSEvent)

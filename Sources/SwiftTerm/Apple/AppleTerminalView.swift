@@ -1603,7 +1603,13 @@ extension TerminalView {
         // while most of its rows are identical, so skipping those is most of
         // the cost of watching one.
         let rowAppearance = rowRenderAppearanceToken()
-        let skippedRows = firstRow <= lastRow
+        // A full-view draw is what AppKit asks for when it has thrown the
+        // backing store away - a window appearing, a view coming back on
+        // screen, a resize. Nothing may be skipped on one of those, however
+        // unchanged the rows are; a partial draw, which is what output
+        // produces, is the only kind that can be trusted.
+        let fullView = dirtyRect.height >= frame.height - 0.5
+        let skippedRows = firstRow <= lastRow && !fullView
             ? rowsUnchanged(firstRow: firstRow, lastRow: lastRow,
                             displayBuffer: displayBuffer, appearance: rowAppearance)
             : []
@@ -2059,11 +2065,15 @@ extension TerminalView {
             }
             #if os(macOS)
             // This row is now on screen as it stands; the next paint can skip it
-            // unless it changes.
-            let paintedLine = displayBuffer.lines[row]
-            paintedRows[displayBuffer.totalLinesTrimmed + row] =
-                PaintedRow(generation: paintedLine.generation,
-                           content: paintedLine.contentHash())
+            // unless it changes. Not while the window is off screen, though:
+            // those pixels do not survive, so nothing may be remembered about
+            // them.
+            if isOnScreen {
+                let paintedLine = displayBuffer.lines[row]
+                paintedRows[displayBuffer.totalLinesTrimmed + row] =
+                    PaintedRow(generation: paintedLine.generation,
+                               content: paintedLine.contentHash())
+            }
             #endif
         }
         
@@ -2142,6 +2152,9 @@ extension TerminalView {
         paintedCols = terminal.cols
         paintedRowsHigh = frame.height
         paintedCellHeight = cellDimension.height
+        paintedLayerContents = isOnScreen
+            ? layer?.contents.map { ObjectIdentifier($0 as AnyObject) }
+            : nil
         paintedBuffer = ObjectIdentifier(displayBuffer)
         paintedAppearance = rowAppearance
         #endif
@@ -2442,7 +2455,14 @@ extension TerminalView {
     /// scroll, a buffer switch, a resize or a change of look.
     func rowsUnchanged(firstRow: Int, lastRow: Int,
                        displayBuffer: Buffer, appearance: UInt64) -> Set<Int> {
-        guard paintedYDisp == displayBuffer.yDisp,
+        // The backing store has to be the one these rows were painted into.
+        // AppKit makes a fresh, empty one whenever it redraws for its own
+        // reasons, and a skipped row on it would simply stay blank.
+        guard isOnScreen,
+              let store = layer?.contents.map({ ObjectIdentifier($0 as AnyObject) }),
+              store == paintedLayerContents,
+              !visibleRect.isEmpty,
+              paintedYDisp == displayBuffer.yDisp,
               paintedTrimmed == displayBuffer.totalLinesTrimmed,
               paintedCols == terminal.cols,
               paintedRowsHigh == frame.height,
@@ -3325,5 +3345,7 @@ extension TerminalView {
 #endif
 
 #endif
+
+
 
 
