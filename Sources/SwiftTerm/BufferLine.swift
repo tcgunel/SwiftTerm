@@ -69,6 +69,29 @@ public final class BufferLine: CustomDebugStringConvertible {
     @inline(__always)
     private func bump() { generation &+= 1 }
 
+    /// A cheap hash of everything this line renders: its cells, their
+    /// attributes, the wrap flag, the render mode and whether it carries
+    /// images.
+    ///
+    /// `generation` answers "was this line written to"; this answers "would it
+    /// look different", which is what a renderer caching per-line draw state
+    /// actually needs to know. A full-screen TUI rewrites rows it has not
+    /// changed - repainting its whole frame is how most of them work - and
+    /// rebuilding those rows' attributed strings and glyphs is the most
+    /// expensive thing a terminal view does.
+    public func contentHash() -> UInt64 {
+        var hasher = Hasher()
+        hasher.combine(dataSize)
+        hasher.combine(isWrapped)
+        hasher.combine(renderMode)
+        hasher.combine(images == nil)
+        let cells = UnsafeBufferPointer(data)
+        for index in 0..<dataSize {
+            cells[index].mixContent(into: &hasher)
+        }
+        return UInt64(bitPattern: Int64(hasher.finalize()))
+    }
+
     public init (cols: Int, fillData: CharData? = nil, isWrapped: Bool = false,
                  bidiState: BidiPresentationState = .default)
     {

@@ -582,6 +582,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     open override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        // The layer's backing store does not survive leaving the window.
+        paintedRows.removeAll()
         startWindowMouseMovedFallback()
 #if canImport(MetalKit)
         guard useMetalRenderer, let currentWindow = window else { return }
@@ -961,6 +963,31 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// arriving, and a flood of lines is skipped for the same reason.
     public var lineFadeInDuration: TimeInterval = 0
 
+    // MARK: - Painted rows
+
+    /// What each row looked like when it was last painted, keyed by absolute
+    /// buffer line. A row that would paint the same pixels again does not need
+    /// painting, and rebuilding a row - attributed strings, runs, attributes,
+    /// glyphs - is the most expensive thing the view does.
+    var paintedRows: [Int: PaintedRow] = [:]
+    /// What the cached rows were painted under: the viewport, the buffer, the
+    /// width, the look. A scroll or a buffer switch moves rows on screen, so
+    /// nothing may be skipped after either.
+    var paintedYDisp = -1
+    var paintedTrimmed = -1
+    var paintedCols = 0
+    var paintedRowsHigh: CGFloat = -1
+    var paintedCellHeight: CGFloat = -1
+    var paintedBuffer: ObjectIdentifier?
+    var paintedAppearance: UInt64?
+    /// Bumped when the look changes in a way no cheap value comparison sees:
+    /// the palette installed by `installColors`, the hovered link.
+    var rowRenderEpoch: UInt64 = 0
+    /// The region this view last asked AppKit to repaint. A draw of anything
+    /// else - AppKit re-creating the layer's backing store, a resize, a view
+    /// coming back into the window - cannot trust the cached rows.
+    var lastInvalidatedRegion: CGRect?
+
     /// When the caret last glided, to keep a flood of output from animating
     /// every step.
     var lastCaretGlide: TimeInterval = 0
@@ -1055,10 +1082,25 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
 #endif
+        // Rows may only be skipped when this draw is one we asked for. AppKit
+        // draws for its own reasons too - a re-created backing store, a view
+        // returning to the window - and on those the pixels are gone even
+        // though the rows are unchanged.
+        if let region = lastInvalidatedRegion, region.contains(dirtyRect) {
+            // ours
+        } else {
+            paintedRows.removeAll()
+        }
+        lastInvalidatedRegion = nil
         guard let currentContext = getCurrentGraphicsContext() else {
             return
         }
         drawTerminalContents (dirtyRect: dirtyRect, context: currentContext, bufferOffset: terminal.displayBuffer.yDisp)
+    }
+
+    open override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        paintedRows.removeAll()
     }
     
     public override func cursorUpdate(with event: NSEvent)
@@ -3278,3 +3320,14 @@ extension TerminalViewDelegate {
     }
 }
 #endif
+
+
+/// What a row looked like the last time it was painted.
+///
+/// The generation is the cheap check - it only moves when the line is written
+/// to - and the content hash answers the question that actually matters: a
+/// full-screen TUI rewrites rows it has not changed.
+struct PaintedRow {
+    var generation: UInt64
+    var content: UInt64
+}

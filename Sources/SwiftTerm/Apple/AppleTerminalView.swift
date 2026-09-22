@@ -535,6 +535,10 @@ extension TerminalView {
         urlAttributes = [:]
         attributes = [:]
         clearCGColorCache()
+        // The palette is not visible to a value comparison, so anything cached
+        // per row has to be thrown away by hand.
+        rowRenderEpoch &+= 1
+        paintedRows.removeAll()
 
         terminal.updateFullScreen ()
         queuePendingDisplay()
@@ -1153,6 +1157,8 @@ extension TerminalView {
 
     func invalidateLinkHighlight(oldRange: [Terminal.LinkMatch.RowRange]?, newRange: [Terminal.LinkMatch.RowRange]?)
     {
+        // A hovered link changes how its row draws without touching the line.
+        rowRenderEpoch &+= 1
         let oldRows = Set(oldRange?.map(\.row) ?? [])
         let newRows = Set(newRange?.map(\.row) ?? [])
         for row in oldRows.union(newRows) {
@@ -1590,13 +1596,35 @@ extension TerminalView {
         var placeholderImageCache: [UInt32: TTImage] = [:]
 
         #if os(macOS)
-        // Clear the invalidated region before painting. We fill only cells that carry
-        // an explicit background; default-background cells rely on transparent backing-
-        // store pixels showing the layer's background color. AppKit clears the backing
-        // store only on a full-view redraw, so a partial repaint (a restricted DECSTBM
-        // scroll region, line insert/delete) otherwise keeps stale glyphs/backgrounds.
-        // Clear to transparent — not fill — so a translucent background is preserved.
-        context.clear(dirtyRect)
+        // Rows whose line has not been touched since it was painted are left
+        // alone: their pixels are already right, and rebuilding a row -
+        // attributed strings, runs, attributes - is the most expensive thing
+        // this view does. A full-screen TUI repaints its whole frame every tick
+        // while most of its rows are identical, so skipping those is most of
+        // the cost of watching one.
+        let rowAppearance = rowRenderAppearanceToken()
+        let skippedRows = firstRow <= lastRow
+            ? rowsUnchanged(firstRow: firstRow, lastRow: lastRow,
+                            displayBuffer: displayBuffer, appearance: rowAppearance)
+            : []
+        if firstRow <= lastRow, skippedRows.count == lastRow - firstRow + 1 {
+            // Nothing on screen has changed; not even the clear is needed.
+            return
+        }
+
+        // Clear what is about to be painted, and only that: a skipped row keeps
+        // its pixels. We fill only cells that carry an explicit background;
+        // default-background cells rely on transparent backing-store pixels
+        // showing the layer's background color. AppKit clears the backing store
+        // only on a full-view redraw, so a partial repaint (a restricted DECSTBM
+        // scroll region, line insert/delete) otherwise keeps stale glyphs and
+        // backgrounds. Clear to transparent — not fill — so a translucent
+        // background is preserved.
+        clearForRepaint(dirtyRect: dirtyRect, firstRow: firstRow, lastRow: lastRow,
+                        skipped: skippedRows, displayBuffer: displayBuffer,
+                        cellHeight: cellHeight, context: context)
+        #else
+        let skippedRows: Set<Int> = []
         #endif
 
         for row in firstRow...lastRow {
@@ -1604,6 +1632,9 @@ extension TerminalView {
                 continue
             }
             if row >= displayBuffer.lines.count {
+                continue
+            }
+            if skippedRows.contains(row) {
                 continue
             }
             let renderMode = displayBuffer.lines [row].renderMode
@@ -2026,6 +2057,14 @@ extension TerminalView {
             case .doubleWidth:
                 context.restoreGState()
             }
+            #if os(macOS)
+            // This row is now on screen as it stands; the next paint can skip it
+            // unless it changes.
+            let paintedLine = displayBuffer.lines[row]
+            paintedRows[displayBuffer.totalLinesTrimmed + row] =
+                PaintedRow(generation: paintedLine.generation,
+                           content: paintedLine.contentHash())
+            #endif
         }
         
 #if os(macOS)
@@ -2096,6 +2135,16 @@ extension TerminalView {
             drawSelectionHandle (drawStart: false, row: end.row)
         }
 #endif
+
+        #if os(macOS)
+        paintedYDisp = displayBuffer.yDisp
+        paintedTrimmed = displayBuffer.totalLinesTrimmed
+        paintedCols = terminal.cols
+        paintedRowsHigh = frame.height
+        paintedCellHeight = cellDimension.height
+        paintedBuffer = ObjectIdentifier(displayBuffer)
+        paintedAppearance = rowAppearance
+        #endif
     }
     
     /// Update visible area
@@ -2196,6 +2245,14 @@ extension TerminalView {
                 region = CGRect (x: 0, y: newY, width: frame.width, height: region.maxY - newY)
             }
         }
+        // Nothing in the changed range renders differently from what is already
+        // on screen: skip the invalidation, and with it the display cycle the
+        // window would otherwise run for it.
+        if rowsArePainted(firstRow: displayBuffer.yDisp + redrawStart,
+                          lastRow: displayBuffer.yDisp + redrawEnd,
+                          displayBuffer: displayBuffer) {
+            return
+        }
 #if canImport(MetalKit)
         if metalView != nil {
             let buffer = displayBuffer
@@ -2228,9 +2285,11 @@ extension TerminalView {
             lastRenderedCursor = (x: buffer.x, y: buffer.yBase + buffer.y, hidden: terminal.cursorHidden)
             requestMetalDisplay()
         } else {
+            lastInvalidatedRegion = region
             setNeedsDisplay(region)
         }
 #else
+        lastInvalidatedRegion = region
         setNeedsDisplay(region)
 #endif
         #else
@@ -2348,6 +2407,128 @@ extension TerminalView {
         layer.add(glide, forKey: key)
     }
 
+    // MARK: - Painting only what changed
+
+    /// Everything outside a line that shapes how that line draws, as one value
+    /// that is cheap to recompute on every paint.
+    func rowRenderAppearanceToken() -> UInt64 {
+        var hasher = Hasher()
+        hasher.combine(font.fontName)
+        hasher.combine(font.pointSize)
+        hasher.combine(fontSmoothing)
+        hasher.combine(nativeForegroundColor)
+        hasher.combine(nativeBackgroundColor)
+        hasher.combine(backgroundOpacity)
+        hasher.combine(selectedTextBackgroundColor)
+        hasher.combine(selectedTextForegroundColor)
+        hasher.combine(useBrightColors)
+        hasher.combine(customBlockGlyphs)
+        hasher.combine(antiAliasCustomBlockGlyphs)
+        hasher.combine(bidiHostPolicy)
+        hasher.combine(rowRenderEpoch)
+        hasher.combine(selection.active)
+        hasher.combine(selection.start.row)
+        hasher.combine(selection.start.col)
+        hasher.combine(selection.end.row)
+        hasher.combine(selection.end.col)
+        return UInt64(bitPattern: Int64(hasher.finalize()))
+    }
+
+    /// The rows in the range that are already on screen exactly as they would
+    /// be painted. Absolute buffer rows, as `drawTerminalContents` uses.
+    ///
+    /// Answers an empty set - and drops the cache - whenever anything the rows
+    /// were painted under has moved, so a stale pixel can never survive a
+    /// scroll, a buffer switch, a resize or a change of look.
+    func rowsUnchanged(firstRow: Int, lastRow: Int,
+                       displayBuffer: Buffer, appearance: UInt64) -> Set<Int> {
+        guard paintedYDisp == displayBuffer.yDisp,
+              paintedTrimmed == displayBuffer.totalLinesTrimmed,
+              paintedCols == terminal.cols,
+              paintedRowsHigh == frame.height,
+              paintedCellHeight == cellDimension.height,
+              paintedBuffer == ObjectIdentifier(displayBuffer),
+              paintedAppearance == appearance,
+              !paintedRows.isEmpty,
+              terminal.kittyGraphicsState.placementsByKey.isEmpty
+        else {
+            paintedRows.removeAll()
+            return []
+        }
+        var unchanged: Set<Int> = []
+        for row in firstRow...lastRow {
+            guard row >= 0, row < displayBuffer.lines.count else { continue }
+            let line = displayBuffer.lines[row]
+            // A row carrying images draws from caches a line's generation does
+            // not describe, so it is always painted again.
+            guard line.images == nil else { continue }
+            let absolute = displayBuffer.totalLinesTrimmed + row
+            // A line that is fading in changes opacity without its cells
+            // changing, so it has to keep being painted until it lands.
+            guard lineFades[absolute] == nil else { continue }
+            guard let painted = paintedRows[absolute] else { continue }
+            // The generation is the cheap answer, and settles most rows. When it
+            // has moved, the question is whether the row would look any
+            // different: a TUI rewriting its frame bumps it without changing a
+            // pixel.
+            if painted.generation == line.generation {
+                unchanged.insert(row)
+            } else if painted.content == line.contentHash() {
+                // Same pixels, new writes: remember the generation so the next
+                // frame takes the cheap path.
+                paintedRows[absolute] = PaintedRow(generation: line.generation,
+                                                   content: painted.content)
+                unchanged.insert(row)
+            }
+        }
+        // The invalidation region allows a cell of descender bleed below its
+        // last row. If that cell belongs to a row being skipped, paint that row
+        // too rather than leaving its top edge cut into.
+        if let lastPainted = (firstRow...lastRow).last(where: { !unchanged.contains($0) }),
+           lastPainted < lastRow {
+            unchanged.remove(lastPainted + 1)
+        }
+        return unchanged
+    }
+
+    /// Clears the part of `dirtyRect` that is about to be painted, leaving the
+    /// rows that are being skipped untouched.
+    func clearForRepaint(dirtyRect: TTRect, firstRow: Int, lastRow: Int,
+                         skipped: Set<Int>, displayBuffer: Buffer,
+                         cellHeight: CGFloat, context: CGContext) {
+        func rowBottom(_ row: Int) -> CGFloat {
+            frame.height - cellHeight * CGFloat(row - displayBuffer.yDisp + 1)
+        }
+        let bandTop = rowBottom(firstRow) + cellHeight
+        let bandBottom = rowBottom(lastRow)
+        if dirtyRect.maxY > bandTop {
+            context.clear(CGRect(x: dirtyRect.minX, y: bandTop,
+                                 width: dirtyRect.width, height: dirtyRect.maxY - bandTop))
+        }
+        if bandBottom > dirtyRect.minY {
+            context.clear(CGRect(x: dirtyRect.minX, y: dirtyRect.minY,
+                                 width: dirtyRect.width, height: bandBottom - dirtyRect.minY))
+        }
+        for row in firstRow...lastRow where !skipped.contains(row) {
+            let band = CGRect(x: dirtyRect.minX, y: rowBottom(row),
+                              width: dirtyRect.width, height: cellHeight)
+            let clipped = band.intersection(dirtyRect)
+            if !clipped.isEmpty {
+                context.clear(clipped)
+            }
+        }
+    }
+
+    /// True when every row in the range is already on screen as it would be
+    /// painted, so a redraw can be skipped outright.
+    func rowsArePainted(firstRow: Int, lastRow: Int, displayBuffer: Buffer) -> Bool {
+        guard firstRow <= lastRow else { return true }
+        let unchanged = rowsUnchanged(firstRow: firstRow, lastRow: lastRow,
+                                      displayBuffer: displayBuffer,
+                                      appearance: rowRenderAppearanceToken())
+        return unchanged.count == lastRow - firstRow + 1
+    }
+
     // MARK: - Lines fading in
 
     /// Marks the line the cursor just left as freshly completed, so it can fade
@@ -2420,10 +2601,12 @@ extension TerminalView {
         for line in lineFades.keys {
             let screenRow = line - buffer.totalLinesTrimmed - buffer.yDisp
             guard screenRow >= 0, screenRow < buffer.rows else { continue }
-            setNeedsDisplay(CGRect(x: 0,
-                                   y: frame.height - cellHeight * CGFloat(screenRow + 1),
-                                   width: frame.width,
-                                   height: cellHeight))
+            let region = CGRect(x: 0,
+                                y: frame.height - cellHeight * CGFloat(screenRow + 1),
+                                width: frame.width,
+                                height: cellHeight)
+            lastInvalidatedRegion = lastInvalidatedRegion?.union(region) ?? region
+            setNeedsDisplay(region)
         }
     }
 
@@ -2449,10 +2632,7 @@ extension TerminalView {
         }
         // throttle
         if !pendingDisplay {
-            // Repaint at the display's refresh rate rather than a fixed 16.67ms
-            // (60fps): on a 120Hz or 180Hz screen the terminal is otherwise
-            // visibly capped while output streams.
-            let rate = Double(window?.screen?.maximumFramesPerSecond ?? 60)
+            let rate = min(15.0, Double(window?.screen?.maximumFramesPerSecond ?? 60))   // TEST: hard cap 15
             let fpsDelay = UInt64(1_000_000_000.0 / max(30, rate))
             pendingDisplay = true
             DispatchQueue.main.asyncAfter(
@@ -3145,3 +3325,5 @@ extension TerminalView {
 #endif
 
 #endif
+
+

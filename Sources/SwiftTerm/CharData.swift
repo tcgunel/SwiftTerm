@@ -330,6 +330,16 @@ public struct CharData: CustomDebugStringConvertible {
         }
     }
 
+    /// Mixes everything about this cell that affects how it draws, so
+    /// `BufferLine.contentHash()` can tell two cells apart without reaching
+    /// into private storage.
+    func mixContent(into hasher: inout Hasher) {
+        hasher.combine(code)
+        hasher.combine(payload.code)
+        hasher.combine(semanticContentCode)
+        hasher.combine(attribute)
+    }
+
     /// The OSC 133 role assigned to this cell, if any.
     public var semanticContent: SemanticContent {
         // An out-of-range byte can only come from corrupt storage; decode it
