@@ -2650,15 +2650,11 @@ extension TerminalView {
         if terminal.synchronizedOutputActive {
             return
         }
-        // throttle
+        // Coalesce with every other terminal in the process rather than
+        // scheduling a repaint for this view alone.
         if !pendingDisplay {
-            let rate = min(15.0, Double(window?.screen?.maximumFramesPerSecond ?? 60))   // TEST: hard cap 15
-            let fpsDelay = UInt64(1_000_000_000.0 / max(30, rate))
             pendingDisplay = true
-            DispatchQueue.main.asyncAfter(
-                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
-                execute: updateDisplay)
-        } else {
+            TerminalRepaintScheduler.shared.schedule(self)
         }
     }
 
@@ -3349,3 +3345,61 @@ extension TerminalView {
 
 
 
+
+
+#if os(macOS)
+/// One repaint tick for every terminal in the process.
+///
+/// Each view used to schedule its own repaint a few milliseconds out. With a
+/// window full of streaming terminals that means a display cycle per terminal
+/// update - and AppKit charges each cycle for walking the window's view tree
+/// (tracking areas, layout, drawing), which is what makes many terminals
+/// expensive to watch. Putting every view on one tick makes that per-cycle cost
+/// proportional to the tick rate instead of the output rate.
+///
+/// The tick is capped at 60fps by default: text does not need more, and this is
+/// the number that decides how much the window spends on the frame itself.
+/// `OOKOOK_TERMINAL_FPS` raises it for anyone who wants the extra smoothness.
+@MainActor
+final class TerminalRepaintScheduler {
+    static let shared = TerminalRepaintScheduler()
+
+    /// Frames per second terminal repaints are coalesced to.
+    static let maximumFPS: Double = {
+        if let raw = ProcessInfo.processInfo.environment["OOKOOK_TERMINAL_FPS"],
+           let value = Double(raw), value >= 1 {
+            return value
+        }
+        return 60
+    }()
+
+    private struct Entry {
+        weak var view: TerminalView?
+    }
+
+    private var pending: [ObjectIdentifier: Entry] = [:]
+    private var timer: Timer?
+
+    func schedule(_ view: TerminalView) {
+        pending[ObjectIdentifier(view)] = Entry(view: view)
+        guard timer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / Self.maximumFPS, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
+        }
+        // .common so a tick still lands while the user is scrolling or dragging.
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func tick() {
+        timer = nil
+        let views = pending.values.compactMap(\.view)
+        pending.removeAll()
+        for view in views {
+            view.updateDisplay()
+        }
+    }
+}
+#endif
