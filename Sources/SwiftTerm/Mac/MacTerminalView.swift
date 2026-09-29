@@ -1139,11 +1139,23 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
 #endif
-        // Rows may only be skipped when this draw is one we asked for. AppKit
-        // draws for its own reasons too - a re-created backing store, a view
-        // returning to the window - and on those the pixels are gone even
-        // though the rows are unchanged.
-        if let region = lastInvalidatedRegion, region.contains(dirtyRect) {
+        // Rows may only be skipped when this draw is one we asked for, of a
+        // view that is entirely on screen.
+        //
+        // AppKit draws for its own reasons too - a re-created backing store, a
+        // view returning to the window - and on those the pixels are gone even
+        // though the rows are unchanged. It also shrinks a request to the part
+        // of the view that is on screen: a terminal that is only partly visible
+        // - a grid tile scrolled half out of its window, a pane taller than the
+        // space it is shown in - is drawn as its visible strip, and the pixels
+        // of that strip do not carry from one draw to the next by themselves.
+        // Skipping rows on such a draw leaves holes that stay until the
+        // periodic heal repaints them, which reads as a tile whose content
+        // flickers while only the rows being written survive. A partly visible
+        // view therefore repaints its visible rows in full; the skip is kept
+        // for a terminal that is visible in full.
+        let fullyVisible = visibleRect.height >= bounds.height - 0.5
+        if let region = lastInvalidatedRegion, region.contains(dirtyRect), fullyVisible {
             // ours
         } else {
             paintedRows.removeAll()
